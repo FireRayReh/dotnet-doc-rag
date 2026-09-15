@@ -117,6 +117,42 @@ public class EnvelopeIngestionPipelineTests : IDisposable
         Assert.Equal(EnvelopeDecryptionException.UniformMessage, ex.Message);
     }
 
+    /// <summary>
+    /// Padding-oracle regression at the pipeline boundary, one layer above
+    /// <see cref="AesCbcEnvelopeDecryptor"/>'s own uniform-error guarantee. Decryption <i>succeeding</i>
+    /// but the recovered plaintext being unrecognisable must be indistinguishable from decryption
+    /// failing outright. If these two diverge, an attacker submitting chosen ciphertexts learns
+    /// whether the padding was valid from the error alone - which is the entire padding oracle,
+    /// reconstructed from a format error. Fix the code, not the test.
+    /// </summary>
+    [Fact]
+    public async Task IngestAsync_ValidKeyButUnrecognisablePlaintext_FailsIdenticallyToAWrongKey()
+    {
+        // Decrypts cleanly under the real key, but is no format the sniffer can identify: control
+        // bytes only, no magic prefix, and a file name carrying no inner extension to fall back on.
+        var unrecognisable = new byte[256];
+        for (var i = 0; i < unrecognisable.Length; i++) unrecognisable[i] = (byte)(i % 7 + 1);
+
+        var decryptsButUnparsable = CustomerEnvelopeEncryptor.Encrypt(unrecognisable, _keyBase64);
+        var wrongKeyBlob = CustomerEnvelopeEncryptor.Encrypt(
+            Encoding.UTF8.GetBytes("a genuine document"), CustomerEnvelopeEncryptor.GenerateKeyBase64());
+
+        var service = BuildService(new Dictionary<string, string> { ["default"] = _keyBase64 });
+
+        using var unparsableStream = new MemoryStream(decryptsButUnparsable);
+        var sniffFailure = await Record.ExceptionAsync(() => service.IngestAsync(
+            unparsableStream, "blob-00931.enc", fileId: null, userId: null, password: null, sourceLabel: "test"));
+
+        using var wrongKeyStream = new MemoryStream(wrongKeyBlob);
+        var decryptFailure = await Record.ExceptionAsync(() => service.IngestAsync(
+            wrongKeyStream, "blob-00932.enc", fileId: null, userId: null, password: null, sourceLabel: "test"));
+
+        Assert.IsType<EnvelopeDecryptionException>(sniffFailure);
+        Assert.IsType<EnvelopeDecryptionException>(decryptFailure);
+        Assert.Equal(decryptFailure.Message, sniffFailure.Message);
+        Assert.Equal(EnvelopeDecryptionException.UniformMessage, sniffFailure.Message);
+    }
+
     [Fact]
     public void IsEnvelopeCandidate_MatchesOnlyTheConfiguredEncryptedExtensions()
     {

@@ -215,6 +215,18 @@ report.pdf.enc ──▶ AesCbcEnvelopeDecryptor ──▶ FormatSniffer ──�
   submit chosen blobs decrypt real documents byte by byte. The specific internal reason is logged at
   **Debug** level, server-side only. `AesCbcEnvelopeDecryptorTests` has an explicit regression test
   asserting all three of wrong-key / tampered / truncated produce an identical type *and* message.
+
+  This holds **across the decrypt/parse boundary too**, which is the subtler half. A blob that
+  decrypts cleanly (valid padding) but whose plaintext is not a recognisable document would
+  otherwise come back as a *format* error while a bad-padding blob came back as a *decryption*
+  error - and that difference alone re-creates the oracle, since it tells the attacker their
+  chosen ciphertext padded correctly. So `IngestionService.DecryptEnvelope` collapses every
+  post-decryption failure (unrecognisable format, CFB container with no password supplied, a
+  parser rejecting the content) into the same opaque `EnvelopeDecryptionException`. The trade-off
+  is a genuine diagnostic loss: an operator debugging a real format problem must read the
+  server-side log, because the caller is deliberately told nothing. `EnvelopeIngestionPipelineTests`
+  pins this with a test asserting a decryptable-but-unparsable blob fails identically to a
+  wrong-key blob.
 - **Plaintext never touches disk.** Decryption is `MemoryStream`/`byte[]` only.
 - Per-operation copies of key material are wiped with `CryptographicOperations.ZeroMemory`; keys come
   only from env vars / config, are never hardcoded, and are never logged - not even truncated.

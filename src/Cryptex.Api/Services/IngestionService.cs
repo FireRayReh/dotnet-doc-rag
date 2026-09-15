@@ -210,39 +210,56 @@ public sealed class IngestionService
         envelope.Position = 0;
         var plaintext = _envelopeDecryptor!.Decrypt(envelope.ToArray(), keyId);
 
-        var sniffed = FormatSniffer.Sniff(plaintext, fileName, extensions);
-
-        if (sniffed.Extension == FormatSniffer.CompoundFileFormat)
+        // Everything past this point must fail as the SAME opaque error the decryptor raises.
+        // "Valid padding but unrecognisable plaintext" reaching a caller as a distinguishable
+        // response re-creates the padding oracle the uniform error exists to deny: an attacker
+        // submitting chosen ciphertexts learns padding validity from the error alone.
+        try
         {
-            // An OLE2/CFB compound file: for Office content this is an MS-OFFCRYPTO-encrypted OOXML
-            // container, so hand it to OfficeCryptoDecryptor and sniff the result again.
-            if (string.IsNullOrEmpty(password))
-                throw new NotSupportedException(
-                    "The decrypted content is an encrypted Office (OLE2/CFB) container; supply the document password to open it.");
-
-            using var cfb = new MemoryStream(plaintext, writable: false);
-            using var inner = _officeCryptoDecryptor.Decrypt(cfb, password);
-            plaintext = inner.ToArray();
-            sniffed = FormatSniffer.Sniff(plaintext, fileName, extensions);
+            var sniffed = FormatSniffer.Sniff(plaintext, fileName, extensions);
 
             if (sniffed.Extension == FormatSniffer.CompoundFileFormat)
-                throw new FormatDetectionException("The decrypted Office container did not yield a recognisable OOXML package.");
+            {
+                // An OLE2/CFB compound file: for Office content this is an MS-OFFCRYPTO-encrypted
+                // OOXML container, so hand it to OfficeCryptoDecryptor and sniff the result again.
+                if (string.IsNullOrEmpty(password))
+                    throw new NotSupportedException(
+                        "The decrypted content is an encrypted Office (OLE2/CFB) container; supply the document password to open it.");
+
+                using var cfb = new MemoryStream(plaintext, writable: false);
+                using var inner = _officeCryptoDecryptor.Decrypt(cfb, password);
+                plaintext = inner.ToArray();
+                sniffed = FormatSniffer.Sniff(plaintext, fileName, extensions);
+
+                if (sniffed.Extension == FormatSniffer.CompoundFileFormat)
+                    throw new FormatDetectionException("The decrypted Office container did not yield a recognisable OOXML package.");
+            }
+
+            var resolvedName = BuildSyntheticFileName(fileName, sniffed.Extension, extensions);
+
+            _logger.LogInformation(
+                "Decrypted envelope {FileName} ({Bytes} bytes plaintext); detected format '{Format}' via {Source}.",
+                fileName, plaintext.Length, sniffed.Extension, sniffed.Source);
+
+            var metadata = new Dictionary<string, object?>
+            {
+                ["envelope_decrypted"] = true,
+                ["detected_format"] = sniffed.Extension,
+                ["format_detection_source"] = sniffed.Source.ToString()
+            };
+
+            return (new MemoryStream(plaintext, writable: false), resolvedName, metadata);
         }
-
-        var resolvedName = BuildSyntheticFileName(fileName, sniffed.Extension, extensions);
-
-        _logger.LogInformation(
-            "Decrypted envelope {FileName} ({Bytes} bytes plaintext); detected format '{Format}' via {Source}.",
-            fileName, plaintext.Length, sniffed.Extension, sniffed.Source);
-
-        var metadata = new Dictionary<string, object?>
+        catch (Exception ex)
         {
-            ["envelope_decrypted"] = true,
-            ["detected_format"] = sniffed.Extension,
-            ["format_detection_source"] = sniffed.Source.ToString()
-        };
-
-        return (new MemoryStream(plaintext, writable: false), resolvedName, metadata);
+            // Logged server-side so an operator can still diagnose a genuine format or
+            // missing-password problem; the caller is told nothing beyond "it didn't work".
+            _logger.LogInformation(
+                ex,
+                "Envelope {FileName}: decryption succeeded but the plaintext could not be resolved to a parsable document.",
+                fileName);
+            throw new EnvelopeDecryptionException(null, ex);
+        }
     }
 
     /// <summary>

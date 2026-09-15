@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <!--
+      Roll forward to a later installed major runtime if an exact net9.0 runtime isn't present
+      (e.g. CI/dev images that ship net8/net10 but skip net9). Harmless when net9.0 is installed:
+      it simply runs on the exact match as usual.
+    -->
+    <RollForward>LatestMajor</RollForward>
+  </PropertyGroup>
+</Project>

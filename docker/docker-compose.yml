@@ -1,0 +1,90 @@
+version: "3.9"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: docrag-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333" # REST (used by the Qdrant dashboard / curl debugging)
+      - "6334:6334" # gRPC (used by DocRag.Api)
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+
+  docrag-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: docrag-api
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    ports:
+      - "8080:8080"
+    volumes:
+      - docrag_data:/app/data
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+
+      # --- Embedding provider selection: AzureOpenAI | Local ---
+      Embedding__Provider: ${EMBEDDING_PROVIDER:-Local}
+      Embedding__AzureOpenAI__Endpoint: ${AZURE_OPENAI_ENDPOINT:-}
+      Embedding__AzureOpenAI__ApiKey: ${AZURE_OPENAI_API_KEY:-}
+      Embedding__AzureOpenAI__Deployment: ${AZURE_OPENAI_DEPLOYMENT:-text-embedding-3-large}
+      Embedding__AzureOpenAI__Dimensions: ${AZURE_OPENAI_DIMENSIONS:-3072}
+      Embedding__Local__BaseUrl: ${LOCAL_EMBEDDING_BASE_URL:-http://host.docker.internal:11434/v1}
+      Embedding__Local__Model: ${LOCAL_EMBEDDING_MODEL:-bge-m3}
+      Embedding__Local__Dimensions: ${LOCAL_EMBEDDING_DIMENSIONS:-1024}
+      Embedding__Local__ApiKey: ${LOCAL_EMBEDDING_API_KEY:-}
+
+      Reranker__BaseUrl: ${RERANKER_BASE_URL:-}
+      Reranker__Model: ${RERANKER_MODEL:-bge-reranker-v2-m3}
+
+      # --- Vector store ---
+      VectorStore__Qdrant__Host: qdrant
+      VectorStore__Qdrant__GrpcPort: 6334
+      VectorStore__Qdrant__ApiKey: ${QDRANT_API_KEY:-}
+      VectorStore__Qdrant__CollectionName: ${QDRANT_COLLECTION_NAME:-docrag_chunks}
+
+      # --- At-rest encryption for retained originals / chunk text ---
+      # Required (and validated at startup) only when RETAIN_ORIGINALS=true below; generate with
+      # `openssl rand -base64 32`. See .env.example.
+      DOC_ENCRYPTION_KEY: ${DOC_ENCRYPTION_KEY:-}
+
+      DocumentRegistry__RetainOriginals: ${RETAIN_ORIGINALS:-false}
+
+  librechat-mongo:
+    image: mongo:7
+    container_name: librechat-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    command: mongod --noauth
+
+  librechat:
+    image: ghcr.io/danny-avila/librechat:latest
+    container_name: librechat
+    restart: unless-stopped
+    depends_on:
+      - librechat-mongo
+      - docrag-api
+    ports:
+      - "3080:3080"
+    environment:
+      HOST: 0.0.0.0
+      MONGO_URI: mongodb://librechat-mongo:27017/LibreChat
+      # Point LibreChat's RAG integration at this service instead of the default Python rag_api sidecar.
+      RAG_API_URL: http://docrag-api:8080
+      RAG_PORT: 8080
+    volumes:
+      - librechat_data:/app/client/public/images
+      - librechat_uploads:/app/uploads
+
+volumes:
+  qdrant_data:
+  docrag_data:
+  mongo_data:
+  librechat_data:
+  librechat_uploads:

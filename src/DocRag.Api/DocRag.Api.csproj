@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="10.2.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DocRag.Core\DocRag.Core.csproj" />
+    <ProjectReference Include="..\DocRag.Ingestion\DocRag.Ingestion.csproj" />
+    <ProjectReference Include="..\DocRag.Security\DocRag.Security.csproj" />
+    <ProjectReference Include="..\DocRag.Embeddings\DocRag.Embeddings.csproj" />
+    <ProjectReference Include="..\DocRag.VectorStore\DocRag.VectorStore.csproj" />
+  </ItemGroup>
+
+</Project>

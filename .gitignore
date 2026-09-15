@@ -1,0 +1,21 @@
+## .NET build output
+bin/
+obj/
+*.user
+
+## Test results
+[Tt]est[Rr]esult*/
+*.trx
+
+## Rider/VS/VSCode
+.vs/
+.vscode/
+*.suo
+.idea/
+
+## Runtime/local data (registry store, retained originals, logs)
+src/DocRag.Api/data/
+docker/.env
+
+## OS cruft
+.DS_Store

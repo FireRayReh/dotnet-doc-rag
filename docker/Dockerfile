@@ -7,20 +7,20 @@ FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
 WORKDIR /src
 
 # Copy csproj files first for better layer caching on dependency restore.
-COPY DocRag.sln ./
-COPY src/DocRag.Core/DocRag.Core.csproj src/DocRag.Core/
-COPY src/DocRag.Ingestion/DocRag.Ingestion.csproj src/DocRag.Ingestion/
-COPY src/DocRag.Security/DocRag.Security.csproj src/DocRag.Security/
-COPY src/DocRag.Embeddings/DocRag.Embeddings.csproj src/DocRag.Embeddings/
-COPY src/DocRag.VectorStore/DocRag.VectorStore.csproj src/DocRag.VectorStore/
-COPY src/DocRag.Api/DocRag.Api.csproj src/DocRag.Api/
-COPY src/DocRag.Tests/DocRag.Tests.csproj src/DocRag.Tests/
+COPY Cryptex.sln ./
+COPY src/Cryptex.Core/Cryptex.Core.csproj src/Cryptex.Core/
+COPY src/Cryptex.Ingestion/Cryptex.Ingestion.csproj src/Cryptex.Ingestion/
+COPY src/Cryptex.Security/Cryptex.Security.csproj src/Cryptex.Security/
+COPY src/Cryptex.Embeddings/Cryptex.Embeddings.csproj src/Cryptex.Embeddings/
+COPY src/Cryptex.VectorStore/Cryptex.VectorStore.csproj src/Cryptex.VectorStore/
+COPY src/Cryptex.Api/Cryptex.Api.csproj src/Cryptex.Api/
+COPY src/Cryptex.Tests/Cryptex.Tests.csproj src/Cryptex.Tests/
 
-RUN dotnet restore src/DocRag.Api/DocRag.Api.csproj
+RUN dotnet restore src/Cryptex.Api/Cryptex.Api.csproj
 
 # Now copy the rest of the source and publish.
 COPY src/ src/
-RUN dotnet publish src/DocRag.Api/DocRag.Api.csproj -c Release -o /app/publish --no-restore
+RUN dotnet publish src/Cryptex.Api/Cryptex.Api.csproj -c Release -o /app/publish --no-restore
 
 # ------------------------------------------------------------------------------------------------
 # Runtime stage
@@ -29,8 +29,8 @@ FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
 WORKDIR /app
 
 # Non-root user for the container process.
-RUN useradd -m -u 1000 docrag
-RUN mkdir -p /app/data && chown -R docrag:docrag /app
+RUN useradd -m -u 1000 cryptex
+RUN mkdir -p /app/data && chown -R cryptex:cryptex /app
 
 COPY --from=build /app/publish ./
 
@@ -38,7 +38,7 @@ ENV ASPNETCORE_URLS=http://+:8080
 ENV ASPNETCORE_ENVIRONMENT=Production
 EXPOSE 8080
 
-USER docrag
+USER cryptex
 VOLUME ["/app/data"]
 
-ENTRYPOINT ["dotnet", "DocRag.Api.dll"]
+ENTRYPOINT ["dotnet", "Cryptex.Api.dll"]

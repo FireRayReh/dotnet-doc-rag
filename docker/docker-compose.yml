@@ -3,28 +3,28 @@ version: "3.9"
 services:
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: docrag-qdrant
+    container_name: cryptex-qdrant
     restart: unless-stopped
     ports:
       - "6333:6333" # REST (used by the Qdrant dashboard / curl debugging)
-      - "6334:6334" # gRPC (used by DocRag.Api)
+      - "6334:6334" # gRPC (used by Cryptex.Api)
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
 
-  docrag-api:
+  cryptex-api:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: docrag-api
+    container_name: cryptex-api
     restart: unless-stopped
     depends_on:
       - qdrant
     ports:
       - "8080:8080"
     volumes:
-      - docrag_data:/app/data
+      - cryptex_data:/app/data
     environment:
       ASPNETCORE_ENVIRONMENT: Production
 
@@ -46,14 +46,29 @@ services:
       VectorStore__Qdrant__Host: qdrant
       VectorStore__Qdrant__GrpcPort: 6334
       VectorStore__Qdrant__ApiKey: ${QDRANT_API_KEY:-}
-      VectorStore__Qdrant__CollectionName: ${QDRANT_COLLECTION_NAME:-docrag_chunks}
+      VectorStore__Qdrant__CollectionName: ${QDRANT_COLLECTION_NAME:-cryptex_chunks}
 
       # --- At-rest encryption for retained originals / chunk text ---
       # Required (and validated at startup) only when RETAIN_ORIGINALS=true below; generate with
       # `openssl rand -base64 32`. See .env.example.
-      DOC_ENCRYPTION_KEY: ${DOC_ENCRYPTION_KEY:-}
+      CRYPTEX_AT_REST_KEY: ${CRYPTEX_AT_REST_KEY:-}
 
       DocumentRegistry__RetainOriginals: ${RETAIN_ORIGINALS:-false}
+
+      # --- Customer-encrypted source files (AES-CBC, IV-prefixed envelopes) ---
+      # Distinct from the at-rest key above and from Office passwords; see the README.
+      Envelope__Enabled: ${ENVELOPE_ENABLED:-false}
+      Envelope__IvLength: ${ENVELOPE_IV_LENGTH:-16}
+      Envelope__PaddingMode: ${ENVELOPE_PADDING_MODE:-Pkcs7}
+      Envelope__DefaultKeyId: ${ENVELOPE_DEFAULT_KEY_ID:-default}
+      Envelope__Hmac__Enabled: ${ENVELOPE_HMAC_ENABLED:-false}
+      Envelope__Hmac__Algorithm: ${ENVELOPE_HMAC_ALGORITHM:-HMACSHA256}
+      Envelope__Hmac__Placement: ${ENVELOPE_HMAC_PLACEMENT:-Append}
+      Envelope__Hmac__Length: ${ENVELOPE_HMAC_LENGTH:-0}
+
+      # Key material arrives only through env vars, one per key id, never via appsettings.json.
+      CRYPTEX_ENVELOPE_KEY_default: ${CRYPTEX_ENVELOPE_KEY_default:-}
+      CRYPTEX_ENVELOPE_HMAC_KEY: ${CRYPTEX_ENVELOPE_HMAC_KEY:-}
 
   librechat-mongo:
     image: mongo:7
@@ -69,14 +84,14 @@ services:
     restart: unless-stopped
     depends_on:
       - librechat-mongo
-      - docrag-api
+      - cryptex-api
     ports:
       - "3080:3080"
     environment:
       HOST: 0.0.0.0
       MONGO_URI: mongodb://librechat-mongo:27017/LibreChat
       # Point LibreChat's RAG integration at this service instead of the default Python rag_api sidecar.
-      RAG_API_URL: http://docrag-api:8080
+      RAG_API_URL: http://cryptex-api:8080
       RAG_PORT: 8080
     volumes:
       - librechat_data:/app/client/public/images
@@ -84,7 +99,7 @@ services:
 
 volumes:
   qdrant_data:
-  docrag_data:
+  cryptex_data:
   mongo_data:
   librechat_data:
   librechat_uploads:

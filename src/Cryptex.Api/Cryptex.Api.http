@@ -1,0 +1,6 @@
+@Cryptex.Api_HostAddress = http://localhost:5203
+
+GET {{Cryptex.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

@@ -14,7 +14,7 @@ obj/
 .idea/
 
 ## Runtime/local data (registry store, retained originals, logs)
-src/DocRag.Api/data/
+src/Cryptex.Api/data/
 docker/.env
 
 ## OS cruft

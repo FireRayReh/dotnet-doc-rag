@@ -1,0 +1,231 @@
+# ------------------------------------------------------------------------------------------------
+# Cryptex - Azure DevOps CI/CD
+#
+#   Build_Test  ->  Package  ->  Deploy
+#   (restore,       (container   (ship to the private server
+#    build, test)    image        over SSH, docker compose up)
+#                    -> registry)
+#
+# Before this runs you must create, in Project settings -> Service connections:
+#   * a Docker Registry service connection  -> name it in the `containerRegistryConnection` variable
+#   * an SSH service connection to the target host -> name it in `sshServiceConnection`
+# and, in Pipelines -> Library, two variable groups (see "Secrets" below).
+#
+# Deploying to a server on a private network needs an agent that can reach it: either a
+# self-hosted agent inside that network, or a Microsoft-hosted agent plus a network path
+# (VPN/ExpressRoute/jump host). Set `agentPool` accordingly.
+# ------------------------------------------------------------------------------------------------
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+      - README.md
+      - '**/*.md'
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  # Non-secret settings (registry login server, target host path, ...).
+  - group: cryptex-config
+
+  # Secrets. Back this group with Azure Key Vault rather than typing values into the UI - it
+  # holds the envelope keys that decrypt your document corpus. See "Secrets" in the README.
+  - group: cryptex-secrets
+
+  - name: buildConfiguration
+    value: 'Release'
+  - name: dotnetSdkVersion
+    value: '9.0.x'
+  - name: imageRepository
+    value: 'cryptex-api'
+  - name: dockerfilePath
+    value: '$(Build.SourcesDirectory)/docker/Dockerfile'
+  # The Dockerfile COPYs Cryptex.sln and src/ from the repo root, so the build context is the
+  # repo root - NOT the docker/ directory the Dockerfile lives in.
+  - name: dockerBuildContext
+    value: '$(Build.SourcesDirectory)'
+  - name: agentPool
+    value: 'ubuntu-latest'
+
+stages:
+  # ----------------------------------------------------------------------------------------------
+  - stage: Build_Test
+    displayName: 'Build and test'
+    jobs:
+      - job: build
+        displayName: 'Restore, build, test'
+        pool:
+          vmImage: $(agentPool)
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Install .NET SDK $(dotnetSdkVersion)'
+            inputs:
+              packageType: 'sdk'
+              version: $(dotnetSdkVersion)
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore'
+            inputs:
+              command: 'restore'
+              projects: 'Cryptex.sln'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Build'
+            inputs:
+              command: 'build'
+              projects: 'Cryptex.sln'
+              arguments: '--configuration $(buildConfiguration) --no-restore'
+
+          # The security properties of the envelope decryptor are enforced by tests
+          # (padding-oracle uniformity in particular). A red test here must block the deploy.
+          - task: DotNetCoreCLI@2
+            displayName: 'Test'
+            inputs:
+              command: 'test'
+              projects: 'Cryptex.sln'
+              arguments: >-
+                --configuration $(buildConfiguration)
+                --no-build
+                --collect:"XPlat Code Coverage"
+                --logger trx
+              publishTestResults: true
+
+          - task: PublishCodeCoverageResults@2
+            displayName: 'Publish code coverage'
+            condition: succeededOrFailed()
+            inputs:
+              summaryFileLocation: '$(Agent.TempDirectory)/**/coverage.cobertura.xml'
+
+  # ----------------------------------------------------------------------------------------------
+  - stage: Package
+    displayName: 'Build and push container image'
+    dependsOn: Build_Test
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: image
+        displayName: 'Docker build and push'
+        pool:
+          vmImage: $(agentPool)
+        steps:
+          - task: Docker@2
+            displayName: 'Build and push $(imageRepository)'
+            inputs:
+              command: 'buildAndPush'
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)
+              buildContext: $(dockerBuildContext)
+              containerRegistry: $(containerRegistryConnection)
+              tags: |
+                $(Build.BuildId)
+                latest
+
+          # The compose file is what the target host runs; ship it as an artifact so Deploy
+          # does not need to clone the repo onto the server.
+          - task: CopyFiles@2
+            displayName: 'Stage compose files'
+            inputs:
+              SourceFolder: '$(Build.SourcesDirectory)/docker'
+              Contents: |
+                docker-compose.yml
+                docker-compose.prod.yml
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/deploy'
+
+          - publish: '$(Build.ArtifactStagingDirectory)/deploy'
+            artifact: deploy
+
+  # ----------------------------------------------------------------------------------------------
+  - stage: Deploy
+    displayName: 'Deploy to private server'
+    dependsOn: Package
+    condition: succeeded()
+    jobs:
+      - deployment: deploy_private
+        displayName: 'Ship to host and restart'
+        pool:
+          vmImage: $(agentPool)
+        # Create this in Pipelines -> Environments. Add an approval check on it so a human
+        # signs off before anything touches the document corpus.
+        environment: 'cryptex-production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: deploy
+
+                - task: CopyFilesOverSSH@0
+                  displayName: 'Copy compose files to host'
+                  inputs:
+                    sshEndpoint: $(sshServiceConnection)
+                    sourceFolder: '$(Pipeline.Workspace)/deploy'
+                    contents: '**'
+                    targetFolder: '$(deployPath)'
+                    overwrite: true
+
+                # Writes .env on the host from pipeline secrets, then pulls and restarts.
+                #
+                # The heredoc is quoted ('ENVEOF') so the shell on the agent does not expand
+                # anything; Azure DevOps substitutes $(...) variables before the script is sent.
+                # .env is written 600 and root-owned: it holds the keys to your documents.
+                - task: SSH@0
+                  displayName: 'Write .env, pull image, restart stack'
+                  inputs:
+                    sshEndpoint: $(sshServiceConnection)
+                    runOptions: 'inline'
+                    inline: |
+                      set -euo pipefail
+                      cd "$(deployPath)"
+
+                      umask 077
+                      cat > .env <<'ENVEOF'
+                      EMBEDDING_PROVIDER=$(EMBEDDING_PROVIDER)
+                      AZURE_OPENAI_ENDPOINT=$(AZURE_OPENAI_ENDPOINT)
+                      AZURE_OPENAI_API_KEY=$(AZURE_OPENAI_API_KEY)
+                      AZURE_OPENAI_DEPLOYMENT=$(AZURE_OPENAI_DEPLOYMENT)
+                      AZURE_OPENAI_DIMENSIONS=$(AZURE_OPENAI_DIMENSIONS)
+                      LOCAL_EMBEDDING_BASE_URL=$(LOCAL_EMBEDDING_BASE_URL)
+                      LOCAL_EMBEDDING_MODEL=$(LOCAL_EMBEDDING_MODEL)
+                      LOCAL_EMBEDDING_DIMENSIONS=$(LOCAL_EMBEDDING_DIMENSIONS)
+                      QDRANT_API_KEY=$(QDRANT_API_KEY)
+                      QDRANT_COLLECTION_NAME=$(QDRANT_COLLECTION_NAME)
+                      CRYPTEX_AT_REST_KEY=$(CRYPTEX_AT_REST_KEY)
+                      RETAIN_ORIGINALS=$(RETAIN_ORIGINALS)
+                      ENVELOPE_ENABLED=$(ENVELOPE_ENABLED)
+                      ENVELOPE_IV_LENGTH=$(ENVELOPE_IV_LENGTH)
+                      ENVELOPE_PADDING_MODE=$(ENVELOPE_PADDING_MODE)
+                      ENVELOPE_DEFAULT_KEY_ID=$(ENVELOPE_DEFAULT_KEY_ID)
+                      ENVELOPE_HMAC_ENABLED=$(ENVELOPE_HMAC_ENABLED)
+                      CRYPTEX_ENVELOPE_KEY_default=$(CRYPTEX_ENVELOPE_KEY_default)
+                      CRYPTEX_ENVELOPE_HMAC_KEY=$(CRYPTEX_ENVELOPE_HMAC_KEY)
+                      CRYPTEX_IMAGE=$(registryLoginServer)/$(imageRepository):$(Build.BuildId)
+                      ENVEOF
+                      chmod 600 .env
+
+                      docker compose -f docker-compose.yml -f docker-compose.prod.yml pull cryptex-api
+                      docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+                      docker image prune -f
+
+                - task: SSH@0
+                  displayName: 'Smoke test /health'
+                  inputs:
+                    sshEndpoint: $(sshServiceConnection)
+                    runOptions: 'inline'
+                    inline: |
+                      set -euo pipefail
+                      for i in $(seq 1 30); do
+                        if curl -fsS http://localhost:8080/health | grep -q '"status"'; then
+                          echo "Cryptex is up."
+                          exit 0
+                        fi
+                        echo "waiting for cryptex-api ($i/30)..."
+                        sleep 2
+                      done
+                      echo "cryptex-api did not become healthy; last 50 log lines:" >&2
+                      docker compose -f "$(deployPath)/docker-compose.yml" logs --tail=50 cryptex-api >&2
+                      exit 1

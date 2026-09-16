@@ -81,8 +81,10 @@ src/
   Cryptex.Tests/        xunit tests
 docker/
   Dockerfile
-  docker-compose.yml
+  docker-compose.yml        base stack (dev); all ports bound to 127.0.0.1
+  docker-compose.prod.yml   production override: registry image, LibreChat secrets
   .env.example
+azure-pipelines.yml         Azure DevOps CI/CD (build/test -> image -> private-server deploy)
 ```
 
 ## The LibreChat `rag_api` contract
@@ -332,33 +334,232 @@ export CRYPTEX_ENVELOPE_KEY_2024=$(openssl rand -base64 32)   # key rotation
 export CRYPTEX_ENVELOPE_HMAC_KEY=$(openssl rand -base64 32)
 ```
 
-## Running locally
+## Getting started
+
+### Prerequisites
+
+| For | You need |
+| --- | --- |
+| Either path | Docker + Docker Compose |
+| Running the API on your host | .NET 9 SDK |
+| Embeddings | **Either** an Azure OpenAI resource with an embeddings deployment, **or** a local OpenAI-compatible server (Ollama, vLLM, llama.cpp) |
+
+### First, the thing that trips everyone up
+
+`dotnet run` starts the service and `/health` will answer `{"status":"UP"}` immediately — but that
+health check does **not** prove the service works. Every ingest and every query will fail until two
+external dependencies are reachable:
+
+1. **Qdrant**, for vector storage.
+2. **An embedding endpoint**, Azure OpenAI or local.
+
+Neither is contacted at startup (both are connected lazily, so the service boots regardless). Start
+Qdrant first, or use the Docker Compose path below, which wires everything together for you.
+
+### Option A — local development loop
+
+API on your host, dependencies in Docker. Best for working on the code.
 
 ```bash
-dotnet restore
-dotnet build
-dotnet test
+# 1. Vector database
+docker run -d --name cryptex-qdrant \
+  -p 127.0.0.1:6333:6333 -p 127.0.0.1:6334:6334 \
+  -v qdrant_data:/qdrant/storage \
+  qdrant/qdrant:latest
+
+# 2. An embedding model. Ollama is the quickest local option:
+ollama pull bge-m3
+ollama serve            # serves an OpenAI-compatible API on :11434
+
+# 3. Point Cryptex at both, and run it.
+export VectorStore__Qdrant__Host=localhost
+export Embedding__Provider=Local
+export Embedding__Local__BaseUrl=http://localhost:11434/v1
+export Embedding__Local__Model=bge-m3
+export Embedding__Local__Dimensions=1024
+
 dotnet run --project src/Cryptex.Api
 ```
 
-Swagger UI is available at `/swagger` in the Development environment.
+Swagger UI: <http://localhost:5203/swagger> (Development environment only).
 
-## Deployment (docker-compose)
+To use **Azure OpenAI** for embeddings instead of a local model, swap step 3 for:
+
+```bash
+export Embedding__Provider=AzureOpenAI
+export Embedding__AzureOpenAI__Endpoint=https://<your-resource>.openai.azure.com/
+export Embedding__AzureOpenAI__ApiKey=<key>
+export Embedding__AzureOpenAI__Deployment=text-embedding-3-large
+export Embedding__AzureOpenAI__Dimensions=3072
+```
+
+> **`Dimensions` must match what the model actually returns.** It sizes the Qdrant collection, which
+> is created on first use and **cannot be resized afterwards**. If you change the embedding model or
+> its dimensionality later, you must drop and re-create the collection, then re-ingest everything.
+
+### Option B — the whole stack in Docker
+
+Everything including LibreChat. Best for evaluating it end to end.
 
 ```bash
 cd docker
-cp .env.example .env   # fill in real values - never commit .env
+cp .env.example .env       # fill in real values — never commit this file
 docker compose up -d --build
 ```
 
-This brings up: `qdrant` (vector DB), `cryptex-api` (this service), `librechat-mongo`, and
-`librechat`, with `RAG_API_URL` already wired to `http://cryptex-api:8080` so LibreChat's file
-upload / RAG UI talks to Cryptex transparently. See `docker/.env.example` for every configurable
-variable (`AZURE_OPENAI_*`, `LOCAL_EMBEDDING_*`, `QDRANT_*`, `CRYPTEX_AT_REST_KEY`,
-`ENVELOPE_*` / `CRYPTEX_ENVELOPE_KEY_*`, ...).
+That brings up `qdrant`, `cryptex-api`, `librechat-mongo` and `librechat`, with `RAG_API_URL`
+already pointed at `http://cryptex-api:8080` so LibreChat's upload/RAG UI talks to Cryptex
+transparently. LibreChat lands on <http://localhost:3080>.
 
-To bulk-ingest an existing company document share, mount it into the `cryptex-api` container and
-call `/admin/ingest-folder` with its in-container path.
+All ports bind to `127.0.0.1` deliberately — see [Before you expose this](#before-you-expose-this).
+
+### Smoke test
+
+```bash
+# 1. Is it up?
+curl -s localhost:5203/health
+# {"status":"UP"}
+
+# 2. Ingest a document.
+echo "The Q3 travel policy requires director approval above 2000 EUR." > /tmp/policy.txt
+curl -s -F "file=@/tmp/policy.txt" -F "file_id=policy-001" localhost:5203/embed
+# {"status":true,"file_id":"policy-001","filename":"policy.txt","chunks":1,"error":null}
+
+# 3. Retrieve it.
+curl -s -X POST localhost:5203/query \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"who approves large travel spend?","k":4}'
+# [{"page_content":"The Q3 travel policy ...","metadata":{...},"score":0.82}]
+```
+
+If step 2 returns `"status":false`, the `error` field is deliberately generic
+(`"Internal error while embedding the document."`) — the real cause is in the **service logs**, and
+is almost always an unreachable embedding endpoint or Qdrant.
+
+`/query` currently has no equivalent error handling: when a dependency is down it returns an
+unhandled `500` rather than a structured error (and in `Development` that response carries a .NET
+stack trace naming internal hosts and ports — one more reason not to run Development outside your
+own machine).
+
+For a **customer-encrypted** file, add the envelope fields (see
+[Customer-encrypted envelopes](#1-customer-encrypted-envelopes-aes-cbc-iv-prefixed)):
+
+```bash
+curl -s -F "file=@/data/report.pdf.enc" -F "file_id=rep-42" -F "key_id=default" localhost:5203/embed
+```
+
+### Ingesting your document corpus
+
+Point the bulk endpoint at a folder the **service** can see. Under Docker that means a path inside
+the container, so mount your share into `cryptex-api` first:
+
+```yaml
+# docker-compose.override.yml
+services:
+  cryptex-api:
+    volumes:
+      - /mnt/company-docs:/data/corpus:ro    # read-only: ingestion never writes back
+```
+
+```bash
+curl -s -X POST localhost:8080/admin/ingest-folder \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "path": "/data/corpus",
+        "recursive": true,
+        "envelope_key_id": "default"
+      }'
+# {"total_files":812,"succeeded":809,"failed":3,"results":[...]}
+```
+
+`password` / `passwords_by_file` supply passwords for protected Office and PDF files;
+`envelope_key_ids_by_file` handles a corpus encrypted under more than one key.
+
+### LibreChat still needs a chat model
+
+Cryptex provides **embeddings and retrieval only**. LibreChat needs its own **chat/completion**
+model configured separately — an Azure OpenAI chat deployment or a local model — through LibreChat's
+own environment variables and `librechat.yaml`. That configuration is independent of the
+`Embedding__*` settings here, and the two can point at different providers (e.g. local embeddings,
+Azure chat). See the [LibreChat configuration docs](https://www.librechat.ai/docs/configuration).
+
+## Before you expose this
+
+Three things to settle before this touches a network anyone else can reach.
+
+- **There is no authentication.** Not on `/embed`, not on `/query`, and not on `/admin/*` — anyone
+  who can reach the port can ingest documents, read indexed content back out, or delete the whole
+  index. This is why every published port in `docker-compose.yml` binds to `127.0.0.1`, and why
+  Compose *appends* rather than replaces port entries is called out there: an override file
+  **cannot** narrow a `0.0.0.0` binding made in the base file. Put an authenticating reverse proxy
+  in front before widening anything.
+- **EPPlus is licensed non-commercially here.** `Program.cs` calls
+  `ExcelPackage.License.SetNonCommercialOrganization(...)`. EPPlus 8 is dual-licensed, and using it
+  on a company's documents is commercial use that **requires a paid licence**. Buy one, or replace
+  the XLSX path (`EncryptedXlsxParser`) with something permissively licensed, before going live.
+- **Qdrant's only auth is one shared API key.** Set `QDRANT_API_KEY` and keep it off the network.
+
+## Deploying with Azure DevOps
+
+`azure-pipelines.yml` in the repo root defines three stages:
+
+| Stage | What it does |
+| --- | --- |
+| `Build_Test` | Restores, builds and runs all tests, publishing results and Cobertura coverage. Runs on every PR. |
+| `Package` | Builds the container image and pushes it to your registry tagged with the build id and `latest`. `main` only. |
+| `Deploy` | Copies the compose files to the target host over SSH, writes `.env` from pipeline secrets, pulls the new image, restarts the stack, and polls `/health` until it answers. |
+
+The test stage gates the deploy on purpose: the envelope decryptor's security properties — the
+padding-oracle uniformity in particular — are enforced by tests, not by review, so a red test must
+stop the release.
+
+### What to create first
+
+In **Project settings → Service connections**:
+
+- a **Docker Registry** connection (Azure Container Registry or any private registry) — put its name
+  in the `containerRegistryConnection` variable
+- an **SSH** connection to the target host — put its name in `sshServiceConnection`
+
+In **Pipelines → Environments**, create `cryptex-production` and add an approval check, so a human
+signs off before a deploy touches the document corpus.
+
+**Reaching a private server.** A Microsoft-hosted agent cannot see a host on your internal network.
+Either register a **self-hosted agent** inside that network and set the `agentPool` variable to its
+pool, or give the hosted agent a network path (VPN, ExpressRoute, or a jump host).
+
+### Secrets
+
+Two variable groups in **Pipelines → Library**:
+
+- `cryptex-config` — non-secret: `registryLoginServer`, `deployPath`, `EMBEDDING_PROVIDER`,
+  `QDRANT_COLLECTION_NAME`, `ENVELOPE_*` settings, and so on.
+- `cryptex-secrets` — **back this with Azure Key Vault** rather than pasting values into the UI. It
+  holds `AZURE_OPENAI_API_KEY`, `CRYPTEX_AT_REST_KEY`, `QDRANT_API_KEY`, the LibreChat secrets, and
+  `CRYPTEX_ENVELOPE_KEY_*` — the keys that decrypt your entire document corpus. Anyone who can edit
+  a pipeline in this project can print a non-Key-Vault variable to the log.
+
+The deploy step writes `.env` on the host with `umask 077` and `chmod 600`. Confirm the deploying
+user owns `$(deployPath)` and that nothing else on the host can read it.
+
+### Rollback
+
+Images are tagged with the build id, so rolling back is redeploying the previous one:
+
+```bash
+ssh <host> 'cd /opt/cryptex && sed -i "s|:[0-9]*$|:<previous-build-id>|" .env \
+  && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d'
+```
+
+Vector data lives in the `qdrant_data` volume and survives redeploys; an embedding-model change is
+*not* covered by this rollback, since it changes what is written into the collection.
+
+### Deploying somewhere other than a VM
+
+The `Deploy` stage assumes a Docker host reached over SSH, matching the private-server requirement.
+To target **Azure Container Apps** or **AKS** instead, keep `Build_Test` and `Package` as they are
+and replace the `Deploy` stage with `AzureContainerApps@1` or `KubernetesManifest@1` — everything
+upstream is deployment-target agnostic.
 
 ## Known limitations / left incomplete
 
